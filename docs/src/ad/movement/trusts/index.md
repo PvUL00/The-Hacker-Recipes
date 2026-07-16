@@ -552,9 +552,9 @@ The output includes the inter-realm keys for each trust relationship, identified
 
 #### 2. Authenticate to the trusted domain
 
-A TDO account cannot use NTLM authentication, only Kerberos. Consequently, once the Kerberos keys for the trust account are obtained, they can be used to authenticate to the trusted domain. The inter-realm keys are not particularly useful here since the attacker already controls the trusting domain.
+Once the trust account's Kerberos keys are obtained, they can be used to authenticate to the trusted domain. It's worth noting the trust account can't authenticate with NTLM. The inter-realm keys are not particularly useful in this context since the attacker already controls the trusting domain.
 
-The trust account name is the NetBIOS name of the trusting domain followed by `$`. Following the intro example, the trust account created in domain A for the trusting domain B is `DOMAIN_B$`. A TGT for this account must be requested on the trusted domain using the credentials obtained in the previous step. The [Pass-the-Key](../kerberos/ptk) technique applies here, using either the NT hash (RC4) or, when available from `tdo_dump`, the AES-256 key (preferred, avoids RC4 downgrade detection).
+The trust account name is the NetBIOS name of the trusting domain followed by `$`. Following the intro example, the trust account created in domain A for the trusting domain B would be `DOMAIN_B$`. A TGT for this account must be requested on the trusted domain using the credentials obtained in the previous step.
 
 The resulting TGT can then be used for various attacks against the trusted domain, including [LDAP Recon](../../recon/ldap), [AD CS exploitation](../adcs/), [computer account creation](../builtins/machineaccountquota#create-a-computer-account), and [Kerberoasting](../kerberos/kerberoast).
 
