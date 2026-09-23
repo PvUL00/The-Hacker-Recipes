@@ -7,7 +7,7 @@ category: infra
 
 ## Theory
 
-[SeBackupPrivilege](https://docs.microsoft.com/en-us/windows-hardware/drivers/ifs/privileges) allows traversing any folder and listing its contents, enabling a file to be copied from a folder even when there is no access control entry (ACE) in the folder's access control list (ACL). This cannot be done with the standard copy command; the data must be copied programmatically using the [`FILE_FLAG_BACKUP_SEMANTICS`](https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea) flag.
+[SeBackupPrivilege](https://docs.microsoft.com/en-us/windows-hardware/drivers/ifs/privileges) allows traversing any folder and listing its contents, enabling a file to be copied from a folder even when there is no access control entry (ACE) in the folder's access control list (ACL). To bypass normal file ACL checks, the copy operation must use backup semantics, for example programmatically with [`FILE_FLAG_BACKUP_SEMANTICS`](https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea) or via built-in tooling that leverages them, such as `robocopy /B` or `/ZB`.
 
 The privilege is assigned by default to members of the **Backup Operators** and **Administrators** local groups. Because it is a token privilege, it may appear as `Disabled` in the current token and must be explicitly enabled before use.
 
