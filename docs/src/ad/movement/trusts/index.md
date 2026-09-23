@@ -1,5 +1,5 @@
 ---
-authors: ShutdownRepo, WodenSec
+authors: ShutdownRepo, WodenSec, PvUL00
 category: ad
 ---
 
@@ -70,7 +70,7 @@ The trust "flavor", on the other hand, represents the nature of the trust relati
 | Shortcut (a.k.a. cross-link) | Transitive | Either | Either | Manual |
 | Realm | Either | Either | Kerberos V5 only | Manual |
 | Forest | Transitive | Either | Either | Manual |
-| External | Non-transitive | One-way | NTLM only | Manual |
+| External | Non-transitive | One-way | Either | Manual |
 
 
 
@@ -155,7 +155,7 @@ When authenticating with NTLM, the process is highly similar, see the [NTLM auth
 
 Inter-forest trusts ("External" and "Forest" trusts) can be configured with different levels of authentication:
 
-* Forest-wide authentication: allows unrestricted authentication from the trusted forest's principals to the trusting forest's resources. This is the least secure level, it completely opens one forest to another (authentication-wise though, not access-wise). This level is specific to intra-forest trusts.
+* Forest-wide authentication: allows unrestricted authentication from the trusted forest's principals to the trusting forest's resources. This is the least secure level, it completely opens one forest to another (authentication-wise though, not access-wise). This level applies to intra-forest trusts and is the default for inter-forest forest trusts.
 * Domain-wide authentication: allows unrestricted authentication from the trusted domain's principals to the trusting domain's resources. This is more secure than forest-wide authentication because it only allows users in a specific (trusted) domain to access resources in another (trusting).
 * Selective authentication: allows only specific users in the trusted domain to access resources in the trusting domain. This is the most secure type of trust because it allows administrators to tightly control access to resources in the trusted domain. In order to allow a "trusted user" to access a "trusting resource", the resource's DACL must include an ACE in which the trusted user has the "`Allowed-To-Authenticate`" extended right (GUID: `68b1d179-0d15-4d4f-ab71-46152e79a7bc`).
 
@@ -321,7 +321,7 @@ From UNIX-like systems, tools like [ldeep](https://github.com/franc-pentest/ldee
 ldeep ldap -u "$USER" -p "$PASSWORD" -d "$DOMAIN" -s ldap://"$DC_IP" trusts
 
 # ldapdomaindump will store HTML, JSON and Greppable output
-ldapdomaindump --user 'DOMAIN\USER' --password "$PASSWORD" --outdir "ldapdomaindump" "$DC_HOST"
+ldapdomaindump --user "$DOMAIN\\$USER" --password "$PASSWORD" --outdir "ldapdomaindump" "$DC_HOST"
 
 # ldapsearch-ad
 ldapsearch-ad --server "$DC_HOST" --domain "$DOMAIN" --username "$USER" --password "$PASSWORD" --type trusts
@@ -344,7 +344,7 @@ From Windows systems, many tools like can be used to enumerate trusts. "[A Guide
 From domain-joined hosts, the `netdom` cmdlet can be used.
 
 ```powershell
-netdom trust /domain:DOMAIN.LOCAL
+netdom trust /domain:$DOMAIN
 ```
 
 #### PowerView
@@ -489,6 +489,77 @@ Rubeus.exe golden /user:Administrator /domain:<compromised_domain_FQDN> /sid:<co
 
 :::
 
+### One-Way Trust account abuse
+
+When a one-way trust is established between a trusting domain (B) and a trusted domain (A), Windows automatically creates a trust account (`DOMAIN_B$`) in the trusted domain (A). The password of this account is stored in the TDO ([Trusted Domain Object](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/b645c125-a7da-4097-84a1-2fa7cea07714#gt_f2ceef4e-999b-4276-84cd-2e2829de5fc4)) of the **trusting** domain (B) in cleartext and as Kerberos keys.
+
+This means that an attacker with Domain Admin privileges on the trusting domain (B) can extract those credentials and authenticate to the trusted domain (A), effectively reversing the expected direction of the one-way trust. This technique has been documented by [itm8](https://itm8.com/articles/sid-filter-as-security-boundary-between-domains-part-7) and [Lorenzo Meacci](https://lorenzomeacci.com/trust-issues-attacking-trust-in-active-directory).
+
+> [!NOTE]
+> This attack requires full compromise of the **trusting** domain. Domain Admin privileges (or equivalent) are a prerequisite.
+
+#### 1. Extract TDO credentials
+
+The password stored in the TDO on the trusting domain is the same as the password of the trust account (`DOMAIN_B$`) on the trusted domain. Extracting it therefore yields valid credentials on the trusted domain.
+
+> [!NOTE]
+> The extracted credentials differ depending on the OS and tool used, which affects the authentication options available in the next step:
+> - **UNIX-like** : [tdo_dump](https://github.com/AlmondOffSec/tdo_dump) returns the trust account's actual Kerberos AES-256/AES-128 keys and NT hash, enabling AES-based Kerberos authentication.
+> - **Windows** : [Mimikatz](https://github.com/gentilkiwi/mimikatz) returns inter-realm trust keys. Of these, only the `rc4_hmac_nt` value corresponds to the trust account NT hash and can be used to request a TGT. The AES keys displayed are inter-realm derivations and cannot be used for that purpose.
+
+::: tabs
+
+== UNIX-like
+
+[tdo_dump](https://github.com/AlmondOffSec/tdo_dump) (Python) operates remotely via Directory Replication Services (DRS) calls and returns the full Kerberos keys of the trust account. More details can be found in this [article](https://offsec.almond.consulting/trust-no-one_are-one-way-trusts-really-one-way.html).
+
+To work, it requires two GUIDs: the GUID of the `TDO` object for the trusted domain, and the GUID of the `ntDSDSA` object of the trusting DC:
+
+```bash
+# Retrieve TDO GUID (with ldeep)
+ldeep ldap -u "$USER" -p "$PASSWORD" -d "$DOMAIN" -s ldap://"$DC_IP" search "(objectClass=trustedDomain)" objectguid,distinguishedname
+
+# Retrieve ntDSDSA GUID (with ldeep)
+ldeep ldap -u "$USER" -p "$PASSWORD" -d "$DOMAIN" -s ldap://"$DC_IP" -b "CN=Configuration,DC=domain,DC=lab" search "(name=NTDS Settings)" objectguid,distinguishedname
+
+# Extract credentials
+python3 tdo_dump.py -u "$USER" -d "$DOMAIN" -t "$DC_HOST.$DOMAIN" -p "$PASSWORD" --tdo-guid "$TDO_GUID" --dsa-guid "$DSA_GUID"
+```
+
+The tool returns the trust account password in cleartext, as an NT hash, and as Kerberos AES-256/AES-128 keys.
+
+== Windows
+
+From a domain controller, [Mimikatz](https://github.com/gentilkiwi/mimikatz) can be used to dump the trust secrets from LSASS. This requires local execution on the DC with administrative privileges.
+
+```powershell
+# On the trusting DC
+mimikatz.exe "lsadump::trust /patch" "exit"
+```
+
+The output includes the inter-realm keys for each trust relationship, identified by the `[In]` and `[Out]` sections:
+
+```
+* aes256_hmac       <AES256_KEY>
+* aes128_hmac       <AES128_KEY>
+* rc4_hmac_nt       <NT_HASH>
+```
+
+> [!NOTE]
+> The AES keys shown are inter-realm trust derivations and cannot be used to request a TGT for the trust account. Only the `rc4_hmac_nt` value (the trust account NT hash) is usable in the next step.
+
+:::
+
+#### 2. Authenticate to the trusted domain
+
+Once the trust account's Kerberos keys are obtained, they can be used to authenticate to the trusted domain. It's worth noting the trust account can't authenticate with NTLM. The inter-realm keys are not particularly useful in this context since the attacker already controls the trusting domain.
+
+The trust account name is the NetBIOS name of the trusting domain followed by `$`. Following the intro example, the trust account created in domain A for the trusting domain B would be `DOMAIN_B$`. A TGT for this account must be requested on the trusted domain using the credentials obtained in the previous step.
+
+The resulting TGT can then be used for various authenticated recon and attacks against the trusted domain.
+
+:::
+
 ### 🛠️ SID filtering bypass
 
 > a few SIDs will (almost) never be filtered: "Enterprise Domain Controllers" (S-1-5-9) SID and those described by the [trusted domain object (TDO)](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-pac/f2ef15b6-1e9b-48b5-bf0b-019f061d41c8#gt_f2ceef4e-999b-4276-84cd-2e2829de5fc4), as well as seven well-known SIDs (see [MS-PAC doc](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-pac/55fc19f2-55ba-4251-8a6a-103dd7c66280), and [improsec's blogpost](https://improsec.com/tech-blog/sid-filter-as-security-boundary-between-domains-part-3-sid-filtering-explained#yui_3_17_2_1_1673614140169_543)).
@@ -599,9 +670,9 @@ The [Kerberos Unconstrained Delegation](../kerberos/delegations/unconstrained#pr
 
 In most cases, the attacker will have to:
 
-1. coerce the authentication ([PrinterBug](../print-spooler-service/printerbug), [PetitPotam](../mitm-and-coerced-authentications/ms-efsr), [ShadowCoerce](../mitm-and-coerced-authentications/ms-fsrvp), [DFSCoerce](../mitm-and-coerced-authentications/ms-dfsnm), etc.) of a high-value target (e.g. domain controller) of the trusting domain
+1. coerce the authentication ([PrinterBug](../print-spooler-service/printerbug), [PetitPotam](../mitm-and-coerced-authentications/rpc-coercions/ms-efsr), [ShadowCoerce](../mitm-and-coerced-authentications/rpc-coercions/ms-fsrvp), [DFSCoerce](../mitm-and-coerced-authentications/rpc-coercions/ms-dfsnm), etc.) of a high-value target (e.g. domain controller) of the trusting domain
 2. retrieve the TGT delegated in the service ticket the trusting resource used to access the attacker-controlled KUD account
-3. authenticate to trusting resources using the extracted TGT ([Pass the Ticket](../kerberos/ptt)) in order to conduct privileged actions (e.g. [DCSync](../credentials/dumping/dcsync))
+3. authenticate to trusting resources using the extracted TGT ([Pass the Ticket](../kerberos/pass-the/ptt)) in order to conduct privileged actions (e.g. [DCSync](../credentials/dumping/dcsync))
 
 
 > [!TIP]
@@ -652,6 +723,8 @@ When an ADCS is installed and configured in an Active Directory environment, a C
 
 [https://learn.microsoft.com/en-us/microsoft-identity-manager/pam/privileged-identity-management-for-active-directory-domain-services](https://learn.microsoft.com/en-us/microsoft-identity-manager/pam/privileged-identity-management-for-active-directory-domain-services)
 
+[https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2003/dd560679(v=ws.10)](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2003/dd560679(v=ws.10))
+
 ### Offensive POV
 
 [https://www.securesystems.de/blog/active-directory-spotlight-trusts-part-2-operational-guidance/](https://www.securesystems.de/blog/active-directory-spotlight-trusts-part-2-operational-guidance/)
@@ -689,6 +762,12 @@ When an ADCS is installed and configured in an Active Directory environment, a C
 [https://improsec.com/tech-blog/sid-filter-as-security-boundary-between-domains-part-6-schema-change-trust-attack-from-child-to-parent](https://improsec.com/tech-blog/sid-filter-as-security-boundary-between-domains-part-6-schema-change-trust-attack-from-child-to-parent)
 
 [https://improsec.com/tech-blog/sid-filter-as-security-boundary-between-domains-part-7-trust-account-attack-from-trusting-to-trusted](https://improsec.com/tech-blog/sid-filter-as-security-boundary-between-domains-part-7-trust-account-attack-from-trusting-to-trusted)
+
+[https://lorenzomeacci.com/trust-issues-attacking-trust-in-active-directory](https://lorenzomeacci.com/trust-issues-attacking-trust-in-active-directory)
+
+[https://itm8.com/articles/sid-filter-as-security-boundary-between-domains-part-7](https://itm8.com/articles/sid-filter-as-security-boundary-between-domains-part-7)
+
+[https://offsec.almond.consulting/trust-no-one_are-one-way-trusts-really-one-way.html](https://offsec.almond.consulting/trust-no-one_are-one-way-trusts-really-one-way.html)
 
 [https://nored0x.github.io/red-teaming/active-directory-Trust-enumeration/](https://nored0x.github.io/red-teaming/active-directory-Trust-enumeration/)
 
